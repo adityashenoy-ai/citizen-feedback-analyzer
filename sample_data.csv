@@ -1,0 +1,9 @@
+complaint_id,complaint_text,state,district,date
+1,Water supply not available for 4 days, Karnataka, Udupi, 2024-09-10
+2,Street lights not working for weeks, Maharashtra, Thane, 2024-08-21
+3,Delay in pension disbursement, Rajasthan, Jaipur, 2024-09-05
+4,Road condition very poor and causing accidents, Uttar Pradesh, Lucknow, 2024-09-12
+5,Garbage is not being collected regularly, Tamil Nadu, Chennai, 2024-08-29
+6,Police not taking action on filed complaint, Delhi, South Delhi, 2024-09-14
+7,Government hospital staff behaving rudely, Kerala, Kochi, 2024-07-11
+8,Electricity outage almost every night, Bihar, Patna, 2024-09-10
