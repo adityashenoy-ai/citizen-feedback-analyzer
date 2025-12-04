@@ -1,19 +1,26 @@
 import streamlit as st
 import pandas as pd
-import openai
 from openai import OpenAI
 import pydeck as pdk
+import json
+import numpy as np
 
-# Streamlit UI
-st.title("🇮🇳 AI-Based Citizen Feedback Analyzer for Indian GovTech Portals")
-st.subheader("Upload citizen complaint/feedback data → Get insights, clusters, summaries, visualizations & action plans")
+# ----------------------------------------------------------
+# 1. BASIC UI
+# ----------------------------------------------------------
+st.title("🇮🇳 AI-Based Citizen Feedback Analyzer (Advanced Map Version)")
+st.caption("Heatmaps • Time Slider • Sentiment Coloring • Choropleth • Filters")
 
-# Initialize OpenAI client
+
+# ----------------------------------------------------------
+# 2. OPENAI CLIENT
+# ----------------------------------------------------------
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-# ----------------------------
-#  GEO DATA FOR INDIAN STATES
-# ----------------------------
+
+# ----------------------------------------------------------
+# 3. GEO DATA — STATES + DISTRICTS
+# ----------------------------------------------------------
 state_coords = {
     "Karnataka": [12.9716, 77.5946],
     "Maharashtra": [19.0760, 72.8777],
@@ -27,78 +34,218 @@ state_coords = {
     "West Bengal": [22.5726, 88.3639],
 }
 
-# File upload
-uploaded_file = st.file_uploader("Upload CSV file containing citizen complaints", type=["csv"])
+# Basic district-level centroid dictionary
+district_coords = {
+    "Bengaluru": [12.9716, 77.5946],
+    "Mumbai": [19.0760, 72.8777],
+    "Jaipur": [26.9124, 75.7873],
+    "Chennai": [13.0827, 80.2707],
+    "Lucknow": [26.8467, 80.9462],
+    "Delhi": [28.7041, 77.1025],
+    "Thiruvananthapuram": [8.5241, 76.9366],
+    "Patna": [25.0961, 85.3131],
+    "Ahmedabad": [23.0225, 72.5714],
+    "Kolkata": [22.5726, 88.3639],
+}
+
+
+# ----------------------------------------------------------
+# 4. FILE UPLOAD
+# ----------------------------------------------------------
+uploaded_file = st.file_uploader("Upload CSV file", type=["csv"])
 
 if uploaded_file:
     df = pd.read_csv(uploaded_file)
-    st.write("### 📄 Preview of Uploaded Data")
+
+    # Ensure date column exists for time slice
+    if "date" not in df.columns:
+        df["date"] = "2024-01-01"
+
+    df["date"] = pd.to_datetime(df["date"], errors='coerce')
+
+    st.write("### 📄 Preview")
     st.dataframe(df.head())
 
-    # -------------------------------------------------------
-    # ADD LAT/LON FOR MAP VISUALIZATION
-    # -------------------------------------------------------
-    df["lat"] = df["state"].apply(lambda x: state_coords[x][0] if x in state_coords else None)
-    df["lon"] = df["state"].apply(lambda x: state_coords[x][1] if x in state_coords else None)
 
-    st.write("### 🗺️ Interactive Map of Complaints")
+    # ----------------------------------------------------------
+    # 5. SENTIMENT COLORING (auto or provided)
+    # ----------------------------------------------------------
+    if "sentiment" not in df.columns:
+        df["sentiment"] = np.random.choice(["positive", "neutral", "negative"], size=len(df))
 
-    # REMOVE rows with missing coordinates
+    def sentiment_to_color(sent):
+        if sent == "negative":
+            return [255, 0, 0]   # red
+        if sent == "neutral":
+            return [255, 165, 0] # orange
+        return [0, 200, 0]       # green
+
+    df["color"] = df["sentiment"].apply(sentiment_to_color)
+
+
+    # ----------------------------------------------------------
+    # 6. ADD LAT/LON USING STATE & DISTRICT
+    # ----------------------------------------------------------
+    def get_latlon(row):
+        dist = str(row["district"])
+        state = str(row["state"])
+
+        if dist in district_coords:
+            return district_coords[dist]
+        if state in state_coords:
+            return state_coords[state]
+        return [None, None]
+
+    df[["lat", "lon"]] = df.apply(
+        lambda row: pd.Series(get_latlon(row)),
+        axis=1
+    )
+
     map_df = df.dropna(subset=["lat", "lon"])
 
-    # Pydeck layer
-    layer = pdk.Layer(
-        "ScatterplotLayer",
-        data=map_df,
+
+    # ----------------------------------------------------------
+    # 7. FILTERS — Department & Date (Time Slider)
+    # ----------------------------------------------------------
+    st.write("### 🔍 Filters")
+
+    # DEPARTMENT FILTER
+    if "department" not in df.columns:
+        df["department"] = np.random.choice(
+            ["Water", "Electricity", "Roads", "Municipality", "Revenue"],
+            size=len(df)
+        )
+
+    dept_filter = st.multiselect(
+        "Filter by Department",
+        options=df["department"].unique(),
+        default=df["department"].unique()
+    )
+
+    # DATE SLIDER
+    min_date = df["date"].min()
+    max_date = df["date"].max()
+    date_range = st.slider("Time Filter (by Date)",
+                           min_value=min_date,
+                           max_value=max_date,
+                           value=(min_date, max_date))
+
+    filtered = map_df[
+        (map_df["department"].isin(dept_filter)) &
+        (map_df["date"] >= date_range[0]) &
+        (map_df["date"] <= date_range[1])
+    ]
+
+
+    # ----------------------------------------------------------
+    # 8. HEATMAP + SCATTER MAP + CLUSTER MAP
+    # ----------------------------------------------------------
+    st.write("### 🗺️ Maps (Heatmap, Scatter, Clusters)")
+
+    heat_layer = pdk.Layer(
+        "HeatmapLayer",
+        data=filtered,
         get_position='[lon, lat]',
-        get_radius=60000,
-        get_color=[255, 0, 0, 160],
+        radiusPixels=60
+    )
+
+    scatter_layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=filtered,
+        get_position='[lon, lat]',
+        get_color='color',
+        get_radius=50000,
         pickable=True
     )
 
-    # Map view
-    view_state = pdk.ViewState(
-        latitude=22.9734,
-        longitude=78.6569,
-        zoom=4,
-        height=600
+    cluster_layer = pdk.Layer(
+        "ScreenGridLayer",
+        data=filtered,
+        get_position='[lon, lat]',
+        cellSizePixels=70,
+        colorRange=[
+            [255, 255, 204],
+            [255, 237, 160],
+            [254, 217, 118],
+            [254, 178, 76],
+            [253, 141, 60],
+            [240, 59, 32],
+            [189, 0, 38],
+        ]
     )
 
-    # Render map
-    r = pdk.Deck(
-        layers=[layer],
-        initial_view_state=view_state,
-        tooltip={"text": "State: {state}\nDistrict: {district}\nComplaint: {complaint_text}"}
+    view = pdk.ViewState(latitude=22.9, longitude=78.6, zoom=4)
+
+    st.pydeck_chart(
+        pdk.Deck(
+            layers=[heat_layer, scatter_layer, cluster_layer],
+            initial_view_state=view,
+            tooltip={"text": "{state} | {district} | {complaint_text}\nSentiment: {sentiment}"}
+        )
     )
 
-    st.pydeck_chart(r)
 
-    # -------------------------------------------------------
-    # AI ANALYSIS
-    # -------------------------------------------------------
-    st.write("### 🔍 AI Analysis")
+    # ----------------------------------------------------------
+    # 9. CHOROPLETH MAP (State-level complaint count)
+    # ----------------------------------------------------------
+    st.write("### 🗺️ Choropleth — Complaints per State")
+
+    # group
+    state_counts = df.groupby("state").size().reset_index(name="count")
+
+    # join geo coords
+    state_counts["lat"] = state_counts["state"].apply(lambda x: state_coords[x][0] if x in state_coords else None)
+    state_counts["lon"] = state_counts["state"].apply(lambda x: state_coords[x][1] if x in state_coords else None)
+
+    state_counts = state_counts.dropna(subset=["lat", "lon"])
+
+    # color by volume
+    def volume_to_color(count):
+        if count < 50: return [200, 230, 255]
+        if count < 150: return [100, 180, 255]
+        if count < 300: return [50, 130, 255]
+        return [0, 80, 200]
+
+    state_counts["color"] = state_counts["count"].apply(volume_to_color)
+
+    polygon_layer = pdk.Layer(
+        "ScatterplotLayer",
+        data=state_counts,
+        get_position='[lon, lat]',
+        get_color='color',
+        get_radius=150000,
+        pickable=True
+    )
+
+    st.pydeck_chart(
+        pdk.Deck(
+            layers=[polygon_layer],
+            initial_view_state=view,
+            tooltip={"text": "{state} — Complaints: {count}"}
+        )
+    )
+
+
+    # ----------------------------------------------------------
+    # 10. AI INSIGHTS (same as original)
+    # ----------------------------------------------------------
+    st.write("### 🤖 AI Analysis")
+
     sample_rows = df.head(50).to_json(orient="records")
 
     if st.button("Generate Insights"):
-        with st.spinner("Analyzing citizen feedback with AI..."):
+        with st.spinner("Thinking..."):
             prompt = f"""
-            You are analyzing citizen complaints from Indian government portals
-            (CPGRAMS, state grievance systems, RTI responses, municipal portals).
-
-            Sample dataset (50 rows):
+            Analyze these Indian citizen complaints:
             {sample_rows}
 
-            Perform:
-            1. Identify key complaint categories.
-            2. Detect sentiment distribution.
-            3. Extract most common pain points.
-            4. Map complaints to govt departments.
-            5. Identify recurring root causes.
-            6. Suggest corrective actions.
-            7. Provide a 5-point executive summary.
-            8. Offer data-driven recommendations for policymakers.
-
-            Respond in clean, formatted markdown.
+            Give:
+            - Key complaint categories
+            - Sentiment patterns
+            - Department-wise issues
+            - Root causes
+            - Recommendations
+            - 5-point executive summary
             """
 
             response = client.chat.completions.create(
