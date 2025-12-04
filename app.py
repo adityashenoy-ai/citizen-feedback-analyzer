@@ -1,34 +1,20 @@
-# app.py
 import streamlit as st
 import pandas as pd
-import numpy as np
-import json
-import re
-import time
+import openai
 from openai import OpenAI
 import pydeck as pdk
-from collections import Counter
 
-# ---------------------------------------------------
-# Page Config
-# ---------------------------------------------------
-st.set_page_config(page_title="AI Citizen Feedback Analyzer (Advanced)", layout="wide")
-st.title("🇮🇳 AI Citizen Feedback Analyzer — Advanced")
-st.caption("NER · Sentiment · Root-Cause Modeling · Dashboards · Maps")
+# Streamlit UI
+st.title("🇮🇳 AI-Based Citizen Feedback Analyzer for Indian GovTech Portals")
+st.subheader("Upload citizen complaint/feedback data → Get insights, clusters, summaries, visualizations & action plans")
 
-# ---------------------------------------------------
-# Init OpenAI Client
-# ---------------------------------------------------
-if "OPENAI_API_KEY" not in st.secrets:
-    st.error("Add OPENAI_API_KEY to Streamlit Secrets")
-    st.stop()
-
+# Initialize OpenAI client
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-# ---------------------------------------------------
-# State → Geo Coordinates
-# ---------------------------------------------------
-STATE_COORDS = {
+# ----------------------------
+#  GEO DATA FOR INDIAN STATES
+# ----------------------------
+state_coords = {
     "Karnataka": [12.9716, 77.5946],
     "Maharashtra": [19.0760, 72.8777],
     "Rajasthan": [26.9124, 75.7873],
@@ -41,326 +27,84 @@ STATE_COORDS = {
     "West Bengal": [22.5726, 88.3639],
 }
 
-# ---------------------------------------------------
-# Utility: Load CSV
-# ---------------------------------------------------
-@st.cache_data(show_spinner=False)
-def load_csv(file):
-    df = pd.read_csv(file)
+# File upload
+uploaded_file = st.file_uploader("Upload CSV file containing citizen complaints", type=["csv"])
 
-    # normalize columns
-    df.columns = [c.lower() for c in df.columns]
+if uploaded_file:
+    df = pd.read_csv(uploaded_file)
+    st.write("### 📄 Preview of Uploaded Data")
+    st.dataframe(df.head())
 
-    if "complaint_text" not in df.columns:
-        for alt in ["complaint", "text", "description"]:
-            if alt in df.columns:
-                df = df.rename(columns={alt: "complaint_text"})
+    # -------------------------------------------------------
+    # ADD LAT/LON FOR MAP VISUALIZATION
+    # -------------------------------------------------------
+    df["lat"] = df["state"].apply(lambda x: state_coords[x][0] if x in state_coords else None)
+    df["lon"] = df["state"].apply(lambda x: state_coords[x][1] if x in state_coords else None)
 
-    if "state" not in df.columns:
-        if "region" in df.columns:
-            df = df.rename(columns={"region": "state"})
-        else:
-            df["state"] = ""
+    st.write("### 🗺️ Interactive Map of Complaints")
 
-    if "district" not in df.columns:
-        df["district"] = ""
+    # REMOVE rows with missing coordinates
+    map_df = df.dropna(subset=["lat", "lon"])
 
-    if "complaint_id" not in df.columns:
-        df.insert(0, "complaint_id", range(1, len(df) + 1))
-
-    return df
-
-# ---------------------------------------------------
-# Utility: LLM call with retry
-# ---------------------------------------------------
-def call_llm(prompt, model="gpt-4o-mini", temperature=0.0):
-    for attempt in range(3):
-        try:
-            resp = client.chat.completions.create(
-                model=model,
-                messages=[{"role": "user", "content": prompt}],
-                temperature=temperature
-            )
-            content = resp.choices[0].message.content
-            return content
-        except Exception as e:
-            time.sleep(1 + attempt)
-            last_error = e
-    return None
-
-# ---------------------------------------------------
-# Extract JSON robustly
-# ---------------------------------------------------
-def extract_json_from_text(text):
-    if not text:
-        raise ValueError("Empty LLM response")
-
-    # 1) Try fenced code block ```json ... ```
-    m = re.search(r"```json\s*(\{.*?\}|\[.*?\])\s*```", text, flags=re.DOTALL)
-    if m:
-        try:
-            return json.loads(m.group(1))
-        except:
-            pass
-
-    # 2) Try first {...}
-    start = text.find("{")
-    end = text.rfind("}")
-    if start != -1 and end != -1:
-        candidate = text[start:end+1]
-        try:
-            return json.loads(candidate)
-        except:
-            # try basic fix
-            fixed = re.sub(r",\s*([}\]])", r"\1", candidate)
-            return json.loads(fixed)
-
-    # 3) Try first [...]
-    start = text.find("[")
-    end = text.rfind("]")
-    if start != -1 and end != -1:
-        candidate = text[start:end+1]
-        try:
-            return json.loads(candidate)
-        except:
-            fixed = re.sub(r",\s*([}\]])", r"\1", candidate)
-            return json.loads(fixed)
-
-    raise ValueError("No valid JSON found")
-
-# ---------------------------------------------------
-# Build Prompts
-# ---------------------------------------------------
-def build_ner_prompt(sample_json):
-    return f"""
-You are an expert NER system. Extract structured entities from the following complaints:
-
-{sample_json}
-
-Return JSON ONLY (wrapped in ```json):
-
-```json
-{{
-  "entities": [
-    {{
-      "id": 1,
-      "issues": ["..."],
-      "organizations": ["..."],
-      "locations": ["..."],
-      "dates": ["..."],
-      "persons": ["..."],
-      "severity": "low"
-    }}
-  ]
-}}
-```json
-
-**Rules**
-- No explanation, ONLY JSON
-- Limit arrays to 5 items
-- severity must be: low / medium / high
-"""
-
-def build_sentiment_prompt(sample_json):
-    return f"""
-You are a sentiment analyzer. Analyze the following complaint texts:
-
-{sample_json}
-
-Return JSON ONLY:
-
-```json
-{{
-  "sentiments": [
-    {{"id": 1, "sentiment": "negative", "score": 0.88}}
-  ],
-  "overall_counts": {{
-    "positive": 0,
-    "neutral": 0,
-    "negative": 0
-  }}
-}}
-```json
-"""
-
-def build_rootcause_prompt(cluster_json, name):
-    return f"""
-You are a policy expert. Analyze cluster '{name}'.
-
-Examples:
-{cluster_json}
-
-Return JSON ONLY:
-
-```json
-{{
-  "cluster": "{name}",
-  "root_causes": [
-    {{
-      "cause": "...",
-      "probability": "high",
-      "impact": "medium",
-      "actions": ["...", "...", "..."],
-      "kpis": ["...","..."]
-    }}
-  ]
-}}
-```json
-"""
-
-# ---------------------------------------------------
-# Sidebar
-# ---------------------------------------------------
-with st.sidebar:
-    st.header("Upload / Settings")
-    file = st.file_uploader("Upload CSV", type=["csv"])
-    model = st.selectbox("LLM Model", ["gpt-4o-mini", "gpt-4o"])
-    max_sample = st.slider("Sample size to LLM", 50, 400, 150, step=50)
-    run_ner = st.checkbox("Run NER", True)
-    run_sent = st.checkbox("Run Sentiment", True)
-    run_rca = st.checkbox("Run Root Cause Analysis", True)
-
-if not file:
-    st.info("Upload a CSV to begin")
-    st.stop()
-
-# ---------------------------------------------------
-# Load file
-# ---------------------------------------------------
-df = load_csv(file)
-df["state"] = df["state"].astype(str)
-df["district"] = df["district"].astype(str)
-df["lat"] = df["state"].apply(lambda x: STATE_COORDS[x][0] if x in STATE_COORDS else None)
-df["lon"] = df["state"].apply(lambda x: STATE_COORDS[x][1] if x in STATE_COORDS else None)
-
-# ---------------------------------------------------
-# Dashboard
-# ---------------------------------------------------
-st.success(f"Loaded {len(df)} complaints")
-
-col1, col2, col3 = st.columns(3)
-col1.metric("Complaints", len(df))
-col2.metric("States", df["state"].nunique())
-col3.metric("Sample to LLM", max_sample)
-
-# Complaints per state
-st.subheader("Complaints per State")
-count_df = df["state"].value_counts().reset_index()
-count_df.columns = ["state", "count"]
-st.bar_chart(count_df.set_index("state")["count"])
-
-
-# Top words
-st.subheader("Top Keywords")
-all_words = " ".join(df["complaint_text"].astype(str).str.lower()).split()
-all_words = [w for w in all_words if len(w) > 4]
-top = Counter(all_words).most_common(20)
-st.table(pd.DataFrame(top, columns=["word", "count"]))
-
-# Map
-st.subheader("Complaint Density Map")
-map_df = df.dropna(subset=["lat","lon"])
-
-if len(map_df):
-    heat = pdk.Layer(
-        "HeatmapLayer",
+    # Pydeck layer
+    layer = pdk.Layer(
+        "ScatterplotLayer",
         data=map_df,
         get_position='[lon, lat]',
-        radiusPixels=60,
-    )
-    scatter = pdk.Layer(
-        "ScatterplotLayer",
-        data=map_df.head(1000),
-        get_position='[lon, lat]',
-        get_radius=50000,
-        get_color=[255,0,0],
+        get_radius=60000,
+        get_color=[255, 0, 0, 160],
         pickable=True
     )
-    view = pdk.ViewState(latitude=22.9, longitude=78.6, zoom=4)
-    deck = pdk.Deck(layers=[heat, scatter], initial_view_state=view,
-        tooltip={"text":"{state}\n{district}\n{complaint_text}"})
-    st.pydeck_chart(deck)
 
-# ---------------------------------------------------
-# Prepare sample for LLM
-# ---------------------------------------------------
-sample = df.head(max_sample)[["complaint_id","complaint_text"]]
-sample_json = json.dumps(
-    [{"id": int(r["complaint_id"]), "text": r["complaint_text"]} for _, r in sample.iterrows()],
-    ensure_ascii=False
-)
+    # Map view
+    view_state = pdk.ViewState(
+        latitude=22.9734,
+        longitude=78.6569,
+        zoom=4,
+        height=600
+    )
 
-# ---------------------------------------------------
-# NER
-# ---------------------------------------------------
-if run_ner:
-    st.subheader("Named Entity Recognition (NER)")
-    prompt = build_ner_prompt(sample_json)
-    raw = call_llm(prompt, model=model, temperature=0.0)
+    # Render map
+    r = pdk.Deck(
+        layers=[layer],
+        initial_view_state=view_state,
+        tooltip={"text": "State: {state}\nDistrict: {district}\nComplaint: {complaint_text}"}
+    )
 
-    try:
-        parsed = extract_json_from_text(raw)
-        ner_entities = parsed.get("entities", parsed)
-        st.success("NER Parsed Successfully")
-        st.json(ner_entities)
-    except:
-        st.error("NER JSON Parsing Failed")
-        st.code(raw)
+    st.pydeck_chart(r)
 
-# ---------------------------------------------------
-# Sentiment
-# ---------------------------------------------------
-if run_sent:
-    st.subheader("Sentiment Analysis")
-    prompt = build_sentiment_prompt(sample_json)
-    raw = call_llm(prompt, model=model, temperature=0.0)
+    # -------------------------------------------------------
+    # AI ANALYSIS
+    # -------------------------------------------------------
+    st.write("### 🔍 AI Analysis")
+    sample_rows = df.head(50).to_json(orient="records")
 
-    try:
-        parsed = extract_json_from_text(raw)
-        st.success("Sentiment Parsed Successfully")
-        st.json(parsed)
+    if st.button("Generate Insights"):
+        with st.spinner("Analyzing citizen feedback with AI..."):
+            prompt = f"""
+            You are analyzing citizen complaints from Indian government portals
+            (CPGRAMS, state grievance systems, RTI responses, municipal portals).
 
-        if "overall_counts" in parsed:
-            dist = parsed["overall_counts"]
-            dist_df = pd.DataFrame.from_dict(dist, orient="index", columns=["count"])
-            st.bar_chart(dist_df)
-    except:
-        st.error("Sentiment JSON parse failed")
-        st.code(raw)
+            Sample dataset (50 rows):
+            {sample_rows}
 
-# ---------------------------------------------------
-# Root Cause Analysis
-# ---------------------------------------------------
-if run_rca:
-    st.subheader("Root Cause Modeling")
+            Perform:
+            1. Identify key complaint categories.
+            2. Detect sentiment distribution.
+            3. Extract most common pain points.
+            4. Map complaints to govt departments.
+            5. Identify recurring root causes.
+            6. Suggest corrective actions.
+            7. Provide a 5-point executive summary.
+            8. Offer data-driven recommendations for policymakers.
 
-    # cluster using top keywords
-    keywords = [w for w,c in top[:5]]
-    clusters = {}
-    for kw in keywords:
-        rows = df[df["complaint_text"].str.contains(kw, case=False, na=False)].head(20)
-        if len(rows):
-            clusters[kw] = rows["complaint_text"].tolist()
+            Respond in clean, formatted markdown.
+            """
 
-    if not clusters:
-        st.warning("No clusters formed")
-    else:
-        for kw, examples in clusters.items():
-            st.write(f"### Cluster: {kw}")
-            cl_json = json.dumps([{"text": t} for t in examples], ensure_ascii=False)
+            response = client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3
+            )
 
-            prompt = build_rootcause_prompt(cl_json, kw)
-            raw = call_llm(prompt, model=model)
-
-            try:
-                parsed = extract_json_from_text(raw)
-                st.json(parsed)
-            except:
-                st.error(f"Failed to parse RCA JSON for cluster {kw}")
-                st.code(raw)
-
-# ---------------------------------------------------
-# End
-# ---------------------------------------------------
-st.markdown("---")
-st.caption("Built by Streamlit + OpenAI — fully LLM-powered analytics.")
+            st.markdown(response.choices[0].message.content)
