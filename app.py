@@ -246,7 +246,9 @@ col3.metric("Sample to LLM", max_sample)
 # Complaints per state
 st.subheader("Complaints per State")
 count_df = df["state"].value_counts().reset_index()
-st.bar_chart(count_df.set_index("index"))
+count_df.columns = ["state", "count"]
+st.bar_chart(count_df.set_index("state")["count"])
+
 
 # Top words
 st.subheader("Top Keywords")
